@@ -21,7 +21,28 @@ async function initPool() {
   });
 
   await pool.execute("SELECT 1");
+  await pool.execute(
+    "ALTER TABLE `user` ADD COLUMN IF NOT EXISTS `phone` varchar(20) NULL AFTER `email`"
+  );
   return pool;
 }
 
-module.exports = { getPool, initPool };
+/** Ensures outbound email audit table exists (`send_email_inquary`). */
+async function ensureSendEmailTable() {
+  const p = getPool();
+  await p.execute(
+    "CREATE TABLE IF NOT EXISTS `send_email_inquary` (" +
+      "`row_id` int NOT NULL AUTO_INCREMENT," +
+      "`user_id` int NOT NULL," +
+      "`from_email` varchar(255) NOT NULL," +
+      "`to_email` varchar(255) NOT NULL," +
+      "`mail_msg` text NOT NULL," +
+      "`create_on` bigint NOT NULL," +
+      "`modified_on` bigint NOT NULL," +
+      "PRIMARY KEY (`row_id`)," +
+      "KEY `idx_send_email_user` (`user_id`)" +
+      ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+  );
+}
+
+module.exports = { getPool, initPool, ensureSendEmailTable };

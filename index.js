@@ -12,11 +12,36 @@ const Queue      = require("bull");
 const { exec }   = require("child_process");
 const bcrypt     = require("bcryptjs");
 const jwt        = require("jsonwebtoken");
-const { getPool, initPool } = require("./db");
+const { getPool, initPool, ensureSendEmailTable } = require("./db");
 require("dotenv").config();
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+
+/** Served to authenticated clients as the compose textarea default (`GET /api/compose-default`). */
+const DEFAULT_COMPOSE_BODY = `I am writing to apply for the Senior Developer position at {company}. With over 4+ years of experience in software development and strong hands-on expertise in Node.js, Express.js, MySQL, Docker, and AWS, I am confident in my ability to contribute meaningfully to your team.
+
+I have experience working in fast-paced environments and collaborating with cross-functional teams to deliver high-quality, scalable backend solutions. My background includes designing REST APIs, implementing authentication systems, managing production deployments, and optimizing database performance — all of which I believe align well with the requirements at {company}.
+
+Please find my resume attached for your review. I would welcome the opportunity to discuss how my skills and experience can contribute to your engineering team.
+
+Thank you for your time and consideration. I look forward to hearing from you.`;
+
+/** Plain message body text as sent (personalized placeholders) — used for DB log + HTML builder. */
+function personalizedBodyText(customText, name, company) {
+  let body = customText || "";
+  if (body) {
+    return body
+      .replace(/{name}/g, name || "Hiring Team")
+      .replace(/{company}/g, company || "your company");
+  }
+  return (
+    `I am writing to apply for a position at ${company || "your company"}. ` +
+    `With my experience and skills, I am confident in my ability to contribute meaningfully to your team.\n\n` +
+    `Please find my resume attached for your review. I would welcome the opportunity to discuss how my ` +
+    `skills and experience can contribute to your engineering team.`
+  );
+}
 
 function requireAuth(req, res, next) {
   const header = req.headers.authorization;
@@ -106,19 +131,7 @@ const emailQueue = new Queue("email-queue", {
 function buildHTML(name, company, customText, senderName, senderEmail, senderPhone) {
   const greeting = name ? `Dear ${name},` : "Dear Hiring Team,";
 
-  // Replace {name} and {company} placeholders typed in UI body
-  let body = customText || "";
-  if (body) {
-    body = body
-      .replace(/{name}/g,    name    || "Hiring Team")
-      .replace(/{company}/g, company || "your company");
-  } else {
-    body =
-      `I am writing to apply for a position at ${company || "your company"}. ` +
-      `With my experience and skills, I am confident in my ability to contribute meaningfully to your team.\n\n` +
-      `Please find my resume attached for your review. I would welcome the opportunity to discuss how my ` +
-      `skills and experience can contribute to your engineering team.`;
-  }
+  const body = personalizedBodyText(customText, name, company);
 
   const displayName  = senderName  || process.env.SENDER_NAME  || "Sender";
   const displayEmail = senderEmail || process.env.EMAIL_USER   || "";
@@ -145,7 +158,18 @@ function startWorker() {
   console.log("⚙️  Starting email worker (3 concurrent)...");
 
   emailQueue.process(3, async (job) => {
-    const { email, name, company, subject, text, file, senderName, senderEmail, senderPhone } = job.data;
+    const {
+      email,
+      name,
+      company,
+      subject,
+      text,
+      file,
+      senderName,
+      senderEmail,
+      senderPhone,
+      userId,
+    } = job.data;
 
     console.log(`📨 Processing → ${email} (Job #${job.id})`);
     await job.progress(10);
@@ -166,6 +190,30 @@ function startWorker() {
     await job.progress(50);
     await transporter.sendMail(mailOptions);
     await job.progress(100);
+
+    const rawUserId = userId ?? job.data.user_id;
+    const uid =
+      rawUserId !== undefined && rawUserId !== null && rawUserId !== ""
+        ? Number(rawUserId)
+        : NaN;
+    if (Number.isFinite(uid) && uid > 0) {
+      try {
+        const pool = getPool();
+        const now = Date.now();
+        const fromEmail = String(senderEmail || process.env.EMAIL_USER || "").slice(0, 255);
+        const toEmail = String(email || "").slice(0, 255);
+        const plainBody = personalizedBodyText(text, name, company);
+        const mailMsg = `${String(subject || "").trim()}\n\n${plainBody}`;
+        await pool.execute(
+          `INSERT INTO \`send_email_inquary\` (user_id, from_email, to_email, mail_msg, created_on, modified_on) VALUES (?, ?, ?, ?, ?, ?)`,
+          [uid, fromEmail || "(unknown)", toEmail || "(unknown)", mailMsg, now, now]
+        );
+      } catch (e) {
+        console.error(`send_email_inquary insert failed → ${email}:`, e.code || "", e.message);
+      }
+    } else {
+      console.warn(`send_email_inquary skipped (no valid userId) → ${email} job=${job.id}`);
+    }
 
     console.log(`✅ Sent → ${email}`);
     return { email, status: "sent" };
@@ -188,11 +236,12 @@ function startWorker() {
 
 // ── API ROUTES ────────────────────────────────────────────────────
 
-// POST /api/register — { email, password, name? } → table `user` (row_id auto)
+// POST /api/register — { name, email, phone, password } → table `user` (row_id auto)
 app.post("/api/register", async (req, res) => {
   try {
     const emailRaw = String(req.body.email || "").trim().toLowerCase();
     const email = emailRaw.slice(0, 50);
+    const phone = String(req.body.phone || "").replace(/\D/g, "").slice(0, 20);
     const password = String(req.body.password || "");
     let name = String(req.body.name || "").trim().slice(0, 50);
     if (!name && email.includes("@")) name = email.split("@")[0].slice(0, 50);
@@ -213,10 +262,11 @@ app.post("/api/register", async (req, res) => {
     const now = Date.now();
     const pool = getPool();
     await pool.execute(
-      `INSERT INTO \`user\` (name, email, password, created_on, modified_on) VALUES (:name, :email, :password, :created_on, :modified_on)`,
+      `INSERT INTO user (name, email, phone_no, password, created_on, modified_on) VALUES (:name, :email, :phone, :password, :created_on, :modified_on)`,
       {
         name,
         email,
+        phone: phone || null,
         password: passwordHash,
         created_on: now,
         modified_on: now,
@@ -239,7 +289,7 @@ app.post("/api/login", async (req, res) => {
     const password = String(req.body.password || "");
     const pool = getPool();
     const [rows] = await pool.execute(
-      `SELECT row_id, email, password, name FROM \`user\` WHERE email = :email LIMIT 1`,
+      `SELECT row_id, email, password, name, COALESCE(phone, phone_no) AS phone FROM \`user\` WHERE email = :email LIMIT 1`,
       { email }
     );
     const row = rows[0];
@@ -251,7 +301,7 @@ app.post("/api/login", async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: "7d" }
     );
-    res.json({ success: true, token, user: { email: row.email, name: row.name } });
+    res.json({ success: true, token, user: { email: row.email, name: row.name, phone: row.phone } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: err.message });
@@ -263,15 +313,20 @@ app.get("/api/me", requireAuth, async (req, res) => {
   try {
     const pool = getPool();
     const [rows] = await pool.execute(
-      `SELECT row_id, email, name FROM \`user\` WHERE row_id = :id LIMIT 1`,
+      `SELECT row_id, email, name, COALESCE(phone, phone_no) AS phone FROM \`user\` WHERE row_id = :id LIMIT 1`,
       { id: req.user.sub }
     );
     const row = rows[0];
     if (!row) return res.status(401).json({ success: false, message: "User not found." });
-    res.json({ success: true, user: { id: row.row_id, email: row.email, name: row.name } });
+    res.json({ success: true, user: { id: row.row_id, email: row.email, name: row.name, phone: row.phone } });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
+});
+
+// GET /api/compose-default — default message template for authenticated clients
+app.get("/api/compose-default", requireAuth, (req, res) => {
+  res.json({ success: true, body: DEFAULT_COMPOSE_BODY });
 });
 
 // POST /api/send  — React BulkMailer.jsx calls this
@@ -284,10 +339,12 @@ app.post("/api/send", requireAuth, upload.single("attachment"), async (req, res)
       return res.status(400).json({ success: false, message: "No recipients." });
     }
 
+    const userId = req.user.sub;
     for (let i = 0; i < list.length; i++) {
       const r = list[i];
       await emailQueue.add(
         {
+          userId,
           email:       r.email,
           name:        r.name    || "",
           company:     r.company || "",
@@ -341,10 +398,12 @@ app.post("/send-bulk-with-attachment", requireAuth, upload.single("file"), async
       return res.status(400).json({ success: false, message: "No recipients." });
     }
 
+    const userId = req.user.sub;
     for (let i = 0; i < list.length; i++) {
       const r = list[i];
       await emailQueue.add(
         {
+          userId,
           email:       typeof r === "string" ? r : r.email,
           name:        r.name    || "",
           company:     r.company || "",
@@ -426,7 +485,8 @@ async function boot() {
 
   try {
     await initPool();
-    console.log("✅ MySQL pool → database:", process.env.MYSQL_DATABASE || "mail_Sender", "\n");
+    await ensureSendEmailTable();
+    console.log("✅ MySQL pool → database:", process.env.MYSQL_DATABASE || "mail_Sender", "| table send_email_inquary OK\n");
   } catch (e) {
     console.error("❌ MySQL connection failed:", e.message);
     process.exit(1);
@@ -438,7 +498,7 @@ async function boot() {
   app.listen(PORT, () => {
     console.log("========================================");
     console.log(`🚀 Server  → http://localhost:${PORT}`);
-    console.log(`🔐 Auth    → POST /api/register  POST /api/login`);
+    console.log(`🔐 Auth    → POST /api/register  POST /api/login  GET /api/compose-default`);
     console.log(`📬 Queue   → GET /api/queue-status (JWT)`);
     console.log(`💊 Health  → GET /api/health`);
     console.log("========================================\n");

@@ -5,7 +5,7 @@ Node.js bulk email queue server (Express + Bull + Redis + Nodemailer) with JWT r
 ## Setup
 
 1. Copy `.env.example` to `.env` and fill values.
-2. Ensure Redis and MySQL are running (`mail_Sender` database, `` `user` `` table).
+2. Ensure Redis and MySQL are running (`mail_Sender` database, tables `` `user` `` and `send_email_inquary`; the latter is auto-created if missing).
 3. Install and run:
 
 ```bash
