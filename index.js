@@ -9,7 +9,6 @@ const nodemailer = require("nodemailer");
 const multer     = require("multer");
 const cors       = require("cors");
 const Queue      = require("bull");
-const { exec }   = require("child_process");
 const bcrypt     = require("bcryptjs");
 const jwt        = require("jsonwebtoken");
 const { getPool, initPool, ensureSendEmailTable } = require("./db");
@@ -57,67 +56,83 @@ function requireAuth(req, res, next) {
   }
 }
 
-app.use(cors());
-app.use(express.json());
+// FIX: production me sirf apne frontend ko allow karo → .env me CORS_ORIGIN
+const corsOrigin = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",").map((o) => o.trim())
+  : "*";
+app.use(cors({ origin: corsOrigin }));
+app.use(express.json({ limit: "2mb" }));
 
 // ── Multer ────────────────────────────────────────────────────────
-const upload = multer({ storage: multer.memoryStorage() });
-
-// ── Nodemailer transporter ────────────────────────────────────────
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
+// FIX: attachment size cap (Nginx ke client_max_body_size ke saath match karo)
+const MAX_ATTACHMENT_MB = Number(process.env.MAX_ATTACHMENT_MB || 10);
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_ATTACHMENT_MB * 1024 * 1024 },
 });
 
-// ── Redis auto-start ──────────────────────────────────────────────
-function startRedis() {
-  return new Promise((resolve) => {
-    console.log("🔴 Checking Redis...");
-    exec("redis-cli ping", (err, stdout) => {
-      if (stdout && stdout.trim() === "PONG") {
-        console.log("✅ Redis already running!");
-        return resolve(true);
-      }
-      console.log("🔄 Starting Redis...");
-      exec("brew services start redis", (err2) => {
-        if (!err2) {
-          setTimeout(() => {
-            exec("redis-cli ping", (e, out) => {
-              if (out && out.trim() === "PONG") {
-                console.log("✅ Redis started via Homebrew!");
-                resolve(true);
-              } else {
-                console.log("⚠️  Redis start failed. Run: brew services start redis");
-                resolve(false);
-              }
-            });
-          }, 1500);
-        } else {
-          exec("sudo service redis-server start", () => {
-            setTimeout(() => {
-              exec("redis-cli ping", (e, out) => {
-                if (out && out.trim() === "PONG") {
-                  console.log("✅ Redis started!");
-                  resolve(true);
-                } else {
-                  console.log("⚠️  Could not auto-start Redis.");
-                  resolve(false);
-                }
-              });
-            }, 1500);
-          });
-        }
-      });
+// ── Nodemailer transporter ────────────────────────────────────────
+// Gmail default. Amazon SES / koi bhi SMTP use karna ho to .env me
+// SMTP_HOST set kar do — baaki code same rehta hai.
+const transporter = process.env.SMTP_HOST
+  ? nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT || 587),
+      secure: process.env.SMTP_SECURE === "true",
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      pool: true,
+      maxConnections: 3,
+      connectionTimeout: 15000,
+      greetingTimeout: 10000,
+      socketTimeout: 30000,
+    })
+  : nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS,
+      },
+      pool: true,
+      maxConnections: 3,
+      // Timeouts — warna dead connection pe job minutes tak latka rehta hai
+      connectionTimeout: 15000,
+      greetingTimeout: 10000,
+      socketTimeout: 30000,
     });
-  });
+
+// ── Redis connectivity check ──────────────────────────────────────
+// FIX: pehle ye `brew services start redis` chalata tha (Mac-only) — Linux/AWS
+// pe fail hota tha. Ab sirf connectivity verify hoti hai; server pe Redis ko
+// systemd (redis-server) ya ElastiCache handle karta hai.
+async function checkRedis() {
+  console.log(`🔴 Checking Redis at ${redisConfig.host}:${redisConfig.port} ...`);
+  try {
+    const client = await emailQueue.client;
+    const pong = await client.ping();
+    if (pong === "PONG") {
+      console.log("✅ Redis connected!");
+      return true;
+    }
+    throw new Error(`unexpected ping reply: ${pong}`);
+  } catch (e) {
+    console.error("❌ Redis connection failed:", e.message);
+    console.error("   Local  → sudo systemctl start redis-server");
+    console.error("   AWS    → .env me REDIS_HOST / REDIS_PORT check karo");
+    return false;
+  }
 }
 
 // ── Bull Queue ────────────────────────────────────────────────────
+// FIX: Redis config env se aata hai (local / ElastiCache dono chalega)
+const redisConfig = {
+  host: process.env.REDIS_HOST || "127.0.0.1",
+  port: Number(process.env.REDIS_PORT || 6379),
+  ...(process.env.REDIS_PASSWORD && { password: process.env.REDIS_PASSWORD }),
+  ...(process.env.REDIS_TLS === "true" && { tls: {} }),
+};
+
 const emailQueue = new Queue("email-queue", {
-  redis: { host: "127.0.0.1", port: 6379 },
+  redis: redisConfig,
   defaultJobOptions: {
     attempts: 3,
     backoff: { type: "fixed", delay: 5000 },
@@ -174,8 +189,11 @@ function startWorker() {
     console.log(`📨 Processing → ${email} (Job #${job.id})`);
     await job.progress(10);
 
+    const fromAddress =
+      process.env.MAIL_FROM || process.env.EMAIL_USER || process.env.SMTP_USER;
+
     const mailOptions = {
-      from: `"${senderName || process.env.SENDER_NAME || "Mailer"}" <${process.env.EMAIL_USER}>`,
+      from: `"${senderName || process.env.SENDER_NAME || "Mailer"}" <${fromAddress}>`,
       to: email,
       subject,
       html: buildHTML(name, company, text, senderName, senderEmail, senderPhone),
@@ -200,7 +218,7 @@ function startWorker() {
       try {
         const pool = getPool();
         const now = Date.now();
-        const fromEmail = String(senderEmail || process.env.EMAIL_USER || "").slice(0, 255);
+        const fromEmail = String(senderEmail || fromAddress || "").slice(0, 255);
         const toEmail = String(email || "").slice(0, 255);
         const plainBody = personalizedBodyText(text, name, company);
         const mailMsg = `${String(subject || "").trim()}\n\n${plainBody}`;
@@ -467,10 +485,46 @@ app.post("/api/test-connection", requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/health
-app.get("/api/health", (req, res) =>
-  res.json({ status: "ok", time: new Date().toISOString(), worker: "running", redis: "connected" })
-);
+// GET /api/health — real checks (ALB / CloudWatch isi ko hit karega)
+app.get("/api/health", async (req, res) => {
+  const health = {
+    status: "ok",
+    time: new Date().toISOString(),
+    worker: process.env.RUN_WORKER === "false" ? "external" : "running",
+    mysql: "unknown",
+    redis: "unknown",
+  };
+
+  try {
+    await getPool().query("SELECT 1");
+    health.mysql = "connected";
+  } catch {
+    health.mysql = "down";
+    health.status = "degraded";
+  }
+
+  try {
+    const client = await emailQueue.client;
+    health.redis = (await client.ping()) === "PONG" ? "connected" : "down";
+  } catch {
+    health.redis = "down";
+    health.status = "degraded";
+  }
+
+  res.status(health.status === "ok" ? 200 : 503).json(health);
+});
+
+// ── Error handler — multer ke size limit jaisi errors saaf JSON me ─────
+app.use((err, req, res, next) => {
+  if (err?.code === "LIMIT_FILE_SIZE") {
+    return res.status(413).json({
+      success: false,
+      message: `Attachment bahut bada hai (max ${MAX_ATTACHMENT_MB} MB).`,
+    });
+  }
+  console.error("Unhandled error:", err);
+  res.status(500).json({ success: false, message: err?.message || "Server error" });
+});
 
 // ── BOOT ──────────────────────────────────────────────────────────
 async function boot() {
@@ -492,34 +546,68 @@ async function boot() {
     process.exit(1);
   }
 
-  await startRedis();
-  startWorker();
+  const redisOk = await checkRedis();
+  if (!redisOk) process.exit(1);
 
-  app.listen(PORT, () => {
+  // RUN_WORKER=false karke worker ko alag process (worker.js) me chala sakte ho.
+  // Default true — worker isi process me chalta hai.
+  if (process.env.RUN_WORKER !== "false") {
+    startWorker();
+  } else {
+    console.log("⏸️  In-process worker disabled (RUN_WORKER=false) — worker.js alag se chalao\n");
+  }
+
+  // 0.0.0.0 pe bind — warna Nginx/EC2 se request nahi aayegi
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log("========================================");
-    console.log(`🚀 Server  → http://localhost:${PORT}`);
+    console.log(`🚀 Server  → http://0.0.0.0:${PORT}`);
     console.log(`🔐 Auth    → POST /api/register  POST /api/login  GET /api/compose-default`);
     console.log(`📬 Queue   → GET /api/queue-status (JWT)`);
     console.log(`💊 Health  → GET /api/health`);
     console.log("========================================\n");
   });
+
+  // Graceful shutdown — pm2 restart/deploy pe running mails beech me na tootein
+  let shuttingDown = false;
+  const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n${signal} received — shutting down gracefully...`);
+    server.close();
+
+    // Safety net: agar koi job atak gaya to bhi 20s me exit karo.
+    // (Job Redis me wapas aa jaayega aur next boot pe retry hoga.)
+    const force = setTimeout(() => {
+      console.warn("⏱️  Shutdown timeout — forcing exit");
+      process.exit(0);
+    }, 20000);
+    force.unref();
+
+    try {
+      await emailQueue.close();          // active jobs finish hone deta hai
+      await getPool().end();
+      clearTimeout(force);
+      console.log("✅ Clean shutdown");
+      process.exit(0);
+    } catch (e) {
+      console.error("Shutdown error:", e.message);
+      process.exit(1);
+    }
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-boot();
+boot().catch((e) => {
+  console.error("❌ Boot failed:", e);
+  process.exit(1);
+});
 
 // ─────────────────────────────────────────────────────────────────
-//  .env file:
-//  JWT_SECRET=long-random-string   ← required for /api/login and protected routes
-//  MYSQL_HOST=127.0.0.1
-//  MYSQL_PORT=3306
-//  MYSQL_USER=root
-//  MYSQL_PASSWORD=...
-//  MYSQL_DATABASE=mail_Sender     ← phpMyAdmin database; table `user`
-//  EMAIL_USER=you@gmail.com
-//  EMAIL_PASS=xxxx_xxxx_xxxx_xxxx
-//  SENDER_NAME=Your Name        ← fallback if UI is empty
-//  SENDER_PHONE=9999999999      ← fallback if UI is empty
+//  Saare env variables `.env.example` me documented hain.
+//  Setup:  cp .env.example .env  →  values bharo  →  node index.js
+//  Schema: mysql -u root -p < schema.sql
+//  AWS:    DEPLOY_AWS.md padho
 //
 //  Protected routes: send Authorization: Bearer <token>
-//  Run: node index.js
 // ─────────────────────────────────────────────────────────────────
